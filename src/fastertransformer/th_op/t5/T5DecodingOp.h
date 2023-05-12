@@ -44,6 +44,7 @@ public:
                                             th::optional<bool>       is_return_cross_attentions_opt,
                                             th::optional<th::Tensor> bad_words_list,
                                             th::optional<th::Tensor> stop_words_list) = 0;
+    virtual void setTokenFile(std::string token_file) = 0;
 };
 
 template<typename T>
@@ -82,6 +83,8 @@ public:
         delete cublas_algo_map_;
         delete cublas_wrapper_mutex_;
     }
+
+    void setTokenFile(std::string token_file) override;
 
     std::vector<th::Tensor> forward(th::optional<int64_t>    beam_width_opt,
                                     size_t                   max_seq_len,
@@ -134,6 +137,10 @@ private:
 
     ft::NcclParam tensor_para_;
     ft::NcclParam pipeline_para_;
+
+    th::optional<std::string> token_file_;
+    th::optional<ft::DecoderPipeWriter> decoder_pipe_writer_;
+
 };
 
 class FasterTransformerT5Decoding: public torch::jit::CustomClassHolder {
@@ -221,14 +228,15 @@ public:
                                     th::optional<bool>       is_return_cum_log_probs,
                                     th::optional<bool>       is_return_cross_attentions,
                                     th::optional<th::Tensor> bad_words_list,
-                                    th::optional<th::Tensor> stop_words_list);
+                                    th::optional<th::Tensor> stop_words_list,
+                                    th::optional<th::string> intermediate_token_file);
 
     std::vector<th::Tensor> get_pickle_info() const;
-
 private:
     const at::ScalarType      _st;
     torch_ext::IFTT5Decoding* ftdecoding;
     std::vector<th::Tensor>   weights;
 };
+
 
 }  // namespace torch_ext

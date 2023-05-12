@@ -19,8 +19,88 @@
 #include "src/fastertransformer/kernels/bert_preprocess_kernels.h"
 #include "src/fastertransformer/kernels/gpt_kernels.h"
 #include "src/fastertransformer/layers/beam_search_layers/BaseBeamSearchLayer.h"
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace fastertransformer {
+
+DecoderPipeWriter::~DecoderPipeWriter() {
+    if (initialized_) {
+        if (tmp_buf_ != nullptr) {
+            free(tmp_buf_);
+        }
+        if (batch_finished_ != nullptr) {
+            free(batch_finished_);
+        }
+        close(fd_);
+    }
+}
+
+DecoderPipeWriter::DecoderPipeWriter():
+    fd_(0),
+    max_seq_len_(1),
+    batch_size_(1),
+    beam_width_(1),
+    tmp_buf_(nullptr) {}
+
+void DecoderPipeWriter::initialize(std::string intermediate_token_file,
+                                        int64_t max_seq_len,
+                                        size_t batch_size)
+{
+    max_seq_len_ = max_seq_len;
+    batch_size_ = batch_size;
+    initialized_ = true;
+    fd_ = open(intermediate_token_file.c_str(), O_WRONLY);
+    tmp_buf_ = (int32_t *)(malloc(sizeof(int32_t) * batch_size_ * beam_width_ * max_seq_len_));
+    if (tmp_buf_ == nullptr) {
+         printf("Error allocating temp cpu buf when setting batch size.\n");
+         exit(1);
+    }
+    batch_finished_ = (bool*)(malloc(sizeof(bool) * batch_size));
+    if (batch_finished_ == nullptr) {
+        printf("Error allocating batch_finished_ buf.\n");
+        exit(1);
+    }
+    memset(batch_finished_, 0, sizeof(bool) * batch_size);
+}
+
+void DecoderPipeWriter::writeVerticalBatchToPipe(TensorMap* output_tensors, bool* h_finished_buf) {
+    cudaD2Hcpy(tmp_buf_, output_tensors->at("output_ids").getPtr<int>(), batch_size_ * beam_width_ * max_seq_len_);
+    sync_check_cuda_error();
+    for (int i = 0; i < batch_size_; i++) {
+        bool* finished = batch_finished_ + sizeof(bool) * i;
+        if (!(*finished)) {
+            size_t written = 0;
+            size_t to_write = sizeof(int32_t);
+            int32_t index = i;
+            while (written < to_write) {
+                written += write(fd_, (char *)(&index) + written, to_write - written);
+            }
+            written = 0;
+            to_write = sizeof(int32_t);
+            char *cur_ptr = (char *)(tmp_buf_ + (max_seq_len_ * i) + cur_seq_num_);
+            int32_t cur_value = *((int32_t *)(cur_ptr));
+            while (written < to_write) {
+                written += write(fd_, cur_ptr + written, to_write - written);
+            }
+            // set finished to be whether the other array records as finished
+            *finished = *(h_finished_buf + sizeof(bool) * i);
+            written = 0;
+            to_write = sizeof(bool);
+            while (written < to_write) {
+                written += write(fd_, (char *)finished + written, to_write - written);
+            }
+        }
+
+    }
+}
+
+void DecoderPipeWriter::incrementCurSequenceNum() {
+    cur_seq_num_++;
+}
+
+
+
 
 template<typename T>
 void T5Decoding<T>::initialize()
@@ -345,11 +425,23 @@ void T5Decoding<T>::registerCallback(callback_sig* fn, void* ctx)
 }
 
 template<typename T>
+void T5Decoding<T>::registerDecoderPipeWriter(std::string filename, size_t max_seq_len, size_t batch_size) {
+    decoder_pipe_writer_.initialize(filename, max_seq_len, batch_size);
+}
+
+template<typename T>
 void T5Decoding<T>::unRegisterCallback()
 {
     token_generated_cb_  = nullptr;
     token_generated_ctx_ = nullptr;
 }
+
+template<typename T>
+void T5Decoding<T>::unregisterDecoderPipeWriter()
+{
+    decoder_pipe_writer_ = {};
+}
+
 
 template<typename T>
 void T5Decoding<T>::forward(std::vector<Tensor>*       output_tensors,
@@ -371,6 +463,8 @@ void T5Decoding<T>::forward(std::vector<Tensor>*       output_tensors,
     std::unordered_map<std::string, Tensor> input_tensors_map{{"encoder_output", input_tensors->at(0)},
                                                               {"encoder_sequence_length", input_tensors->at(1)}};
 
+    // output tensors map has two entries: output_ids and sequence_length
+    // tensors
     std::unordered_map<std::string, Tensor> output_tensors_map{{"output_ids", output_tensors->at(0)},
                                                                {"sequence_length", output_tensors->at(1)}};
     forward(&output_tensors_map, &input_tensors_map, decoding_weights);
@@ -382,13 +476,14 @@ void T5Decoding<T>::forward(std::unordered_map<std::string, Tensor>*       outpu
                             const T5DecodingWeight<T>*                     decoding_weights)
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
+    printf("In  forward funtion that takes unordered_maps for input and output and converts to tensor; converts them into input and output tensor map\n");
     TensorMap input_map(*input_tensors);
     TensorMap output_map(*output_tensors);
     forward(&output_map, &input_map, decoding_weights);
 }
 
 template<typename T>
-void T5Decoding<T>::setOutputTensors(TensorMap* output_tensors, TensorMap const* input_tensors)
+void T5Decoding<T>::setOutputTensors(TensorMap* output_tensors, TensorMap const* input_tensors, bool is_last)
 {
     if (pipeline_para_.rank_ != pipeline_para_.world_size_ - 1) {
         return;
@@ -399,8 +494,9 @@ void T5Decoding<T>::setOutputTensors(TensorMap* output_tensors, TensorMap const*
     auto const sequence_lengths = output_tensors->at("sequence_length").getPtr<int>();
     auto const max_seq_len      = output_tensors->at("output_ids").shape[2];
 
-    if (beam_width > 1) {
+    if (beam_width > 1 && is_last) {
         if (using_beam_hyps) {
+            printf("In using beam hyps\n");
             beam_hyps_.sequence_lengths_src = sequence_lengths;
             beam_hyps_.parent_ids_src       = parent_ids_buf_;
             beam_hyps_.output_ids_src       = output_ids_buf_;
@@ -429,6 +525,7 @@ void T5Decoding<T>::setOutputTensors(TensorMap* output_tensors, TensorMap const*
             sync_check_cuda_error();
         }
         else {
+            printf("In invoke gather tree\n");
             // For beam search, do gather_tree
             invokeGatherTree(output_ids_transpose_buf_,
                              output_tensors->at("sequence_length").getPtr<int>(),
@@ -478,6 +575,7 @@ void T5Decoding<T>::setOutputTensors(TensorMap* output_tensors, TensorMap const*
     }
 
     if (output_tensors->isExist("is_finished")) {
+        printf("Doing something to is_finished\n");
         cudaD2Dcpy(
             output_tensors->at("is_finished").getPtr<bool>(), finished_buf_, output_tensors->at("is_finished").size());
     }
@@ -597,7 +695,6 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
     // When step = k,  we put output ids and caches at step k, and the sequence_length would be k - 1 before
     // complete this step.
 
-    FT_LOG_DEBUG(__PRETTY_FUNCTION__);
     FT_CHECK(input_tensors->size() >= 2);
     FT_CHECK(output_tensors->size() >= 2);
     FT_CHECK(input_tensors->at("encoder_output").shape.size() == 3);
@@ -631,9 +728,13 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
     const DataType data_type        = getTensorType<T>();
     int*           sequence_lengths = output_tensors->at("sequence_length").getPtr<int>();
 
+    // memset the output_ids to be 0 (before any decoding on the batch has
+    // started)
     cudaMemsetAsync(
         output_tensors->at("output_ids").getPtr<int>(), 0, output_tensors->at("output_ids").sizeBytes(), stream_);
+    // memset output_ids_buf_ to be 0
     cudaMemsetAsync(output_ids_buf_, 0, sizeof(int) * batch_size * beam_width * (max_seq_len + 1), stream_);
+    // memset parent_ids_buf_ to be 0
     cudaMemsetAsync(parent_ids_buf_, 0, sizeof(int) * batch_size * beam_width * (max_seq_len + 1), stream_);
     if (beam_width > 1) {
         cudaMemsetAsync(
@@ -720,11 +821,11 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
     const size_t local_batch_size = getLocalBatchSize(batch_size, 1, pipeline_para_.world_size_);
     FT_CHECK(batch_size % local_batch_size == 0);
     const size_t iteration_num = batch_size / local_batch_size;
+    
     for (int step = max_input_length; step <= (int)max_seq_len; step++) {
         FT_LOG_DEBUG("%s::step: %d", __PRETTY_FUNCTION__, step);
         const int src_indir_idx = beam_width > 1 ? (step - 1) & 0x1 : 0;
         const int tgt_indir_idx = 1 - src_indir_idx;
-
         for (uint ite = 0; ite < iteration_num; ++ite) {
             const int id_offset               = ite * local_batch_size * beam_width;
             const int d_model_offset          = id_offset * d_model_;
@@ -782,6 +883,10 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
                 decoder_input_tensors.push_back(input_tensors->at("ia3_tasks").slice({local_batch_size}, id_offset));
             }
 
+            // the reason it's (128, 512) is because local_batch_size * 4 is 32
+            // * 4 which is 128
+            // so is it doing completions in sequence for all things in the
+            // batch?
             std::vector<Tensor> decoder_output_tensors{
                 Tensor{MEMORY_GPU,
                        data_type,
@@ -801,7 +906,7 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
                     {(size_t)id_offset,
                      batch_size * beam_width * head_num_ / tensor_para_.world_size_ * max_seq_len * mem_max_seq_len}});
             }
-
+            //printf("Step: %lu, ite: %lu\n", step, ite);
             decoder_->forward(
                 &decoder_output_tensors, &decoder_input_tensors, &decoding_weights->decoder_layer_weights);
 
@@ -1015,6 +1120,7 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
                     dynamic_decode_output_tensors.insert(*t);
                 }
 
+                // the input to this 
                 dynamic_decode_layer_->forward(&dynamic_decode_output_tensors, &dynamic_decode_input_tensors);
             }
         }
@@ -1046,16 +1152,23 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
             sync_check_cuda_error();
         }
 
-        cudaD2Hcpy(h_finished_buf_, finished_buf_, batch_size * beam_width);
         uint sum = 0;
+        cudaD2Hcpy(h_finished_buf_, finished_buf_, batch_size * beam_width);
         for (uint i = 0; i < batch_size * beam_width; i++) {
             sum += (int)h_finished_buf_[i];
         }
         if (sum == batch_size * beam_width) {
+            // this break is when all things are finished
             break;
         }
+        else if (decoder_pipe_writer_.initialized()) {
+            setOutputTensors(output_tensors, input_tensors, false);
+            sendTensorsToFirstPipelineNode(output_tensors, input_tensors);
+            decoder_pipe_writer_.writeVerticalBatchToPipe(output_tensors, h_finished_buf_);
+            decoder_pipe_writer_.incrementCurSequenceNum();
+        }
         else if (step < (int)max_seq_len && token_generated_cb_) {
-            setOutputTensors(output_tensors, input_tensors);
+            setOutputTensors(output_tensors, input_tensors, false);
             sendTensorsToFirstPipelineNode(output_tensors, input_tensors);
             if (pipeline_para_.rank_ == 0 && tensor_para_.rank_ == 0) {
                 token_generated_cb_(output_tensors, token_generated_ctx_);
@@ -1063,8 +1176,12 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
         }
     }
 
-    setOutputTensors(output_tensors, input_tensors);
+    setOutputTensors(output_tensors, input_tensors, true);
     sendTensorsToFirstPipelineNode(output_tensors, input_tensors);
+    if (decoder_pipe_writer_.initialized()) {
+        decoder_pipe_writer_.writeVerticalBatchToPipe(output_tensors, h_finished_buf_);
+        decoder_pipe_writer_.incrementCurSequenceNum();
+    }
 
     if (is_free_buffer_after_forward_) {
         freeBuffer();

@@ -15,6 +15,8 @@
  */
 
 #include "src/fastertransformer/th_op/t5/T5DecodingOp.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace th = torch;
 
@@ -194,6 +196,11 @@ FTT5Decoding<T>::FTT5Decoding(int64_t                        head_num,
 }
 
 template<typename T>
+void FTT5Decoding<T>::setTokenFile(std::string token_file) {
+    token_file_ = token_file;
+}
+
+template<typename T>
 std::vector<th::Tensor> FTT5Decoding<T>::forward(th::optional<int64_t>    beam_width_opt,
                                                  size_t                   max_seq_len,
                                                  th::optional<int64_t>    top_k_opt,
@@ -291,6 +298,9 @@ std::vector<th::Tensor> FTT5Decoding<T>::forward(th::optional<int64_t>    beam_w
                           nullptr,
                           0,
                           ft::LinearAdapterConfig{adapter_inter_size_, adapter_layer_norm_type_});
+    if (token_file_.has_value()) {
+        decoding.registerDecoderPipeWriter(token_file_.value(), max_seq_len, batch_size);
+    }
     ft::DataType data_type = ft::getTensorType<T>();
 
     ft::TensorMap input_tensors(
@@ -662,12 +672,18 @@ std::vector<th::Tensor> FasterTransformerT5Decoding::forward(th::optional<int64_
                                                              th::optional<bool>       is_return_cum_log_probs,
                                                              th::optional<bool>       is_return_cross_attentions,
                                                              th::optional<th::Tensor> bad_words_list,
-                                                             th::optional<th::Tensor> stop_words_list)
+                                                             th::optional<th::Tensor> stop_words_list,
+                                                             th::optional<th::string> intermediate_token_file)
 {
     CHECK_INPUT(memory, _st);
     CHECK_TH_CUDA(memory_seq_lens);
     CHECK_CONTIGUOUS(memory_seq_lens);
     TORCH_CHECK(memory_seq_lens.dtype() == torch::kInt32, "mem_seq_lens dtype should be int32");
+
+    // define callback that writes intermediate tokens back out to the token
+    if (intermediate_token_file.has_value()) {
+        ftdecoding->setTokenFile(intermediate_token_file.value());
+    }
 
     auto results = ftdecoding->forward(beam_width,
                                        (size_t)max_seq_len,
@@ -767,3 +783,6 @@ static auto fasterTransformerT5DecodingTHS =
                               th::Tensor,
                               th::Tensor>())
         .def("forward", &torch_ext::FasterTransformerT5Decoding::forward);
+        //.def("model_stream_callback_t5", &torch_ext::FasterTransformerT5Decoding::model_stream_callback_t5);
+
+

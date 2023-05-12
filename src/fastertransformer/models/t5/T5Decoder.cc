@@ -405,6 +405,7 @@ void T5Decoder<T>::forward(std::vector<Tensor>*                         output_t
             continue;
         }
 
+        // this either gets output of encoder OR last decoder output
         T* decoder_input  = (l == 0) ? input_tensors->at(0).getPtr<T>() : decoder_layer_output_;
         T* decoder_output = (l == num_layer_ - 1) ? output_tensors->at(0).getPtr<T>() : decoder_layer_output_;
 

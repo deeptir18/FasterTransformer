@@ -38,6 +38,26 @@ struct fallBackType<half> {
     using Type = half;
 };
 
+class DecoderPipeWriter {
+    public:
+        ~DecoderPipeWriter();
+        DecoderPipeWriter();
+        void initialize(std::string intermediate_token_file, int64_t max_seq_len, size_t batch_size);
+        DecoderPipeWriter(std::string intermediate_token_file, int64_t max_seq_len, size_t batch_size);
+        void writeVerticalBatchToPipe(TensorMap* output_tensors, bool* h_finished);
+        void incrementCurSequenceNum();
+        bool initialized() { return initialized_; }
+    private:
+        bool initialized_ = false;
+        int fd_;
+        int64_t max_seq_len_;
+        size_t batch_size_;
+        size_t beam_width_ = 1;
+        size_t cur_seq_num_ = 0;
+        int32_t *tmp_buf_ = nullptr;
+        bool *batch_finished_ = nullptr;
+};
+
 template<typename T>
 class T5Decoding: public BaseLayer {
 private:
@@ -136,6 +156,9 @@ protected:
     callback_sig* token_generated_cb_  = nullptr;
     void*         token_generated_ctx_ = nullptr;
 
+    DecoderPipeWriter decoder_pipe_writer_ = DecoderPipeWriter();
+
+
 public:
     T5Decoding(size_t                              max_batch_size,
                size_t                              max_seq_len,
@@ -193,7 +216,10 @@ public:
     void registerCallback(callback_sig* fn, void* ctx);
     void unRegisterCallback();
 
-    void setOutputTensors(TensorMap* output_tensors, const TensorMap* input_tensors);
+    void registerDecoderPipeWriter(std::string token_file, size_t max_seq_len, size_t batch_size);
+    void unregisterDecoderPipeWriter();
+
+    void setOutputTensors(TensorMap* output_tensors, const TensorMap* input_tensors, bool is_last);
     void sendTensorsToFirstPipelineNode(TensorMap* output_tensors, const TensorMap* input_tensors);
 };
 

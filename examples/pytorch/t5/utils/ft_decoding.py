@@ -473,7 +473,7 @@ class FTT5Decoding(nn.Module):
                 len_penalty, repetition_penalty, presence_penalty, min_length, random_seed,
                 mem_hidden_states, mem_seq_len,
                 is_return_output_log_probs, is_return_cum_log_probs, is_return_cross_attentions=False,
-                bad_words_list=None, stop_words_list=None):
+                bad_words_list=None, stop_words_list=None, token_stream = None):
         # TODO (bhsueh) Not found an method to put a None Type into op forward function
         # So, the top_k and top_p must be some values now.
         results = self.decoding.forward(beam_width, max_seq_len,
@@ -481,7 +481,8 @@ class FTT5Decoding(nn.Module):
                                         temperature, len_penalty, repetition_penalty, presence_penalty, min_length,
                                         random_seed, mem_hidden_states, mem_seq_len,
                                         is_return_output_log_probs, is_return_cum_log_probs, is_return_cross_attentions,
-                                        bad_words_list, stop_words_list)
+                                        bad_words_list, stop_words_list,
+                                        token_stream)
         return results
 
 
@@ -495,7 +496,8 @@ class FTT5(nn.Module):
                 top_k, top_p, beam_search_diversity_rate = 0.0,
                 temperature=1.0, len_penalty=0.0, repetition_penalty=None, presence_penalty=None, min_length=0, random_seed=0,
                 is_return_output_log_probs=False, is_return_cum_log_probs=False, is_return_cross_attentions=False,
-                bad_words_list=None, stop_words_list=None):
+                bad_words_list=None, stop_words_list=None,
+                intermediate_fifo_file = None):
         input_ids = input_token.input_ids.to("cuda").type(torch.int32)
         mem_seq_len = 0
         if hasattr(input_token, "attention_mask"):
@@ -522,8 +524,12 @@ class FTT5(nn.Module):
                                         is_return_cross_attentions,  # optional, can be None
                                         bad_words_list, # optional, can be None
                                         stop_words_list, # optional, can be None
+                                        intermediate_fifo_file, # optional, can be None
                                         )
+        # results.pop(0) is a tensor called "output_ids"
+        # results.pop(1) is sequence_length
         ft_decoding_outputs = results.pop(0).reshape([-1, beam_size, max_seq_len])
+        # batch_size * beam_width = for each thing, how long the sequence was
         ft_decoding_seq_lens = results.pop(0).reshape([-1, beam_size])
         if is_return_output_log_probs:
             ft_output_log_probs = results.pop(0)
