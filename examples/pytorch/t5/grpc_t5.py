@@ -50,22 +50,75 @@ from examples.pytorch.decoding.utils.recover_bpe import recover_bpe
 
 LOGGER = logging.getLogger(__name__)
 
-
 class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
     def __init__(self, args_dict):
         super().__init__()
-        self.batch_size = args_dict['batch_size']
+        self.args_dict = args_dict
+        args_dict['beam_size'] = 1
+        args_dict['topk'] = 1
+        args_dict['topp'] = 0.0
+        args_dict['temperature'] = 1.0
+        args_dict['len_penalty'] = 0.0
+        args_dict['beam_search_diversity_rate'] = 0
+        args_dict['repetition_penalty'] = 1.0
+        self.fifo_path = args_dict['fifo_path']
+
+        model_path = args_dict['model_path'] if args_dict['model_path'] != None else args_dict['model']
         self.ft_t5 = init_ftt5(args_dict)
+        self.tokenizer = T5Tokenizer.from_pretrained(model_path)
+        try:
+            self.fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
+        except:
+            self.fast_tokenizer = T5Tokenizer.from_pretrained(model_path)
         ## TODO: open grpc client connection to the Rust tokenizer for sending
         ## requests to the next service
-        self.next_port = args_dict['next_port']
+    
+    def get(self, var):
+        return self.args_dict[var]
     
     def RunLanguageModel(self, request, context):
         batch_size = len(request.query)
-        print(f"Received non pipelined request with batch size {batch_size}")
+        LOGGER.info(f"Received non pipelined request with batch size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
-        print(input_texts)
+        if len(input_texts) != self.get('batch_size'):
+            LOGGER.warn(f"Got input text length {len(input_texts)}; batch size"\
+                        f"is {self.get('batch_size')}.")
+            ## TODO: add Error option to RPC
+            return lm_retriever_pb2.Empty()
+        input_tokens = self.tokenizer(input_texts, 
+                                      return_tensors = 'pt', 
+                                      padding = True)
+        bad_words_list = None
+        stop_words_list = None
+        tmp_beam_size =  self.get('beam_size')
+        ft_decoding_outputs, ft_decoding_seq_lens = self.ft_t5(input_tokens,
+                                                                  None,
+                                                                  tmp_beam_size,
+                                                                  self.get('max_seq_len'),
+                                                                  self.get('topk'),
+                                                                  self.get('topp'),
+                                                               beam_search_diversity_rate=self.get('beam_search_diversity_rate'),
+                                                                  is_return_output_log_probs=False,
+                                                                  is_return_cum_log_probs=False,
+                                                                  repetition_penalty=self.get('repetition_penalty'),
+                                                                  temperature=self.get('temperature'),
+                                                                  len_penalty=self.get('len_penalty'),
+                                                                  bad_words_list=bad_words_list,
+                                                                  stop_words_list=stop_words_list,
+                                                                  intermediate_fifo_file=None)
+        ## tokenize the outputs and construct a token vec batch
+        lm_output_batch = lm_retriever_pb2.LmOutputBatch(outputs=[])
+        for b in range(self.get('batch_size')):
+            seq_len = ft_decoding_seq_lens[b][0]
+            token_list = self.fast_tokenizer.decode(
+                    ft_decoding_outputs[b][0][:seq_len],
+                    skip_special_tokens = True)
+            print(token_list)
+            lm_output = lm_retriever_pb2.LmOutput(output = token_list,
+                                                  request_id=request.query[b].request_id)
+            lm_output_batch.outputs.append(lm_output)
+        ## TODO: send token_vec_batch to the next microservice
         return lm_retriever_pb2.Empty()
     
     def RunLanguageModelPipelined(self, request, context):
@@ -73,9 +126,65 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         print(f"Received pipelined request with batch_size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
-        print(input_texts)
+        input_tokens = self.tokenizer(input_texts, return_tensors = 'pt', padding =True)
+        if not(os.path.exists(self.fifo_path)):
+            os.mkfifo(self.fifo_path, 0x600)
+        p = mp.Process(target = read_from_pipe_and_tokenize,
+                       args = (
+                           self.fast_tokenizer,
+                           self.fifo_path,
+                           batch_size,
+                           request.query[0].request_id,
+                           ))
+        p.start()
+        bad_words_list = None
+        stop_words_list = None
+        tmp_beam_size =  self.get('beam_size')
+        ft_decoding_outputs, ft_decoding_seq_lens = self.ft_t5(input_tokens,
+                                                                  None,
+                                                                  tmp_beam_size,
+                                                                  self.get('max_seq_len'),
+                                                                  self.get('topk'),
+                                                                  self.get('topp'),
+                                                               beam_search_diversity_rate=self.get('beam_search_diversity_rate'),
+                                                                  is_return_output_log_probs=False,
+                                                                  is_return_cum_log_probs=False,
+                                                                  repetition_penalty=self.get('repetition_penalty'),
+                                                                  temperature=self.get('temperature'),
+                                                                  len_penalty=self.get('len_penalty'),
+                                                                  bad_words_list=bad_words_list,
+                                                                  stop_words_list=stop_words_list,
+                                                                  intermediate_fifo_file=self.fifo_path)
+        p.join()
+        LOGGER.info("Joined subprocess")
         return lm_retriever_pb2.Empty()
-        # TODO: run non pipelined version of language model
+
+def read_from_pipe_and_tokenize(fast_tokenizer, 
+                                fifo_path, 
+                                batch_size,
+                                batch_start):
+    LOGGER.info("In read from pipe with tokenize")
+    LOGGER.info(f"fifo_path: {fifo_path}, batch_size: {batch_size}, batch_start: {batch_start}")
+    r = os.open(fifo_path, os.O_RDONLY)
+    tokens_read = 0
+    finished = [0 for _ in range(batch_size)]
+    token_batch = lm_retriever_pb2.TokenBatch(tokens=[])
+    while sum(finished) < batch_size:
+        index = read_int32_from_file(r)
+        value = read_int32_from_file(r)
+        index_done = read_bool_from_file(r)
+        tokenized = fast_tokenizer.decode([value],
+                                          skip_special_tokens = True)
+        LOGGER.info(f"Read out of pipe: index {index}, value {value},"\
+                    f"tokenized {tokenized}, is_done {index_done}")
+        token = lm_retriever_pb2.Token(word=tokenized,
+                                       is_start=index==0,
+                                       is_end=index_done,
+                                       request_id=batch_start+index)
+        token_batch.tokens.append(token)
+        finished[index] = index_done
+    print(token_batch)
+    LOGGER.info("Returning")
 
 def init_ftt5(args_dict):
     torch.set_printoptions(precision=6)
@@ -188,188 +297,6 @@ def init_ftt5(args_dict):
     ft_t5 = FTT5(ft_encoder, ft_decoding)
     return ft_t5
 
-
-        
-def run_translation(args_dict):
-    batch_size = args_dict['batch_size']
-    beam_size = 1
-    max_seq_len = args_dict['max_seq_len']
-    source_file = args_dict["source"]
-    tgt_file = args_dict["target"]
-    beam_search_diversity_rate = 0.0
-    topk = 1
-    topp = 0.0
-    tensor_para_size = 1
-    pipeline_para_size = 1
-    max_ite = args_dict['max_iteration']
-    repetition_penalty = 1.0
-    temperature = 1.0
-    len_penalty = 0.0
-    ## huggingface without bias and use relative position embedding
-    ## relative position embedding -> 0, absolute position embedding -> 1
-    t5_with_bias = False
-    use_gated_activation = False
-    t5_with_moe = False
-    position_embedding_type = 0
-    weight_data_type = np.float32
-    ## only huggingface model path supported
-    model_path = args_dict['model_path'] if args_dict['model_path'] != None else args_dict['model']
-    ckpt_path = args_dict['ckpt_path']
-    model_type = "HuggingFace"
-    load_data_type = args_dict['load_data_type']
-    ## read checkpoint config if exists
-    ckpt_config = configparser.ConfigParser()
-    activation_type = "relu"
-
-    LOGGER.info("\n=============== Argument ===============")
-    for key in args_dict:
-        LOGGER.info("{}: {}".format(key, args_dict[key]))
-    LOGGER.info("========================================")
-
-    lib_path = args_dict['lib_path']
-    t5_model = T5ForConditionalGeneration.from_pretrained(model_path)
-    if dist.is_mpi_available():
-        try:
-            dist.init_process_group(backend='mpi')
-            rank = dist.get_rank()
-        except:
-            rank = dist.get_rank()
-    else:
-        rank = 0
-    tokenizer = T5Tokenizer.from_pretrained(model_path)
-    try:
-        fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
-    except:
-        fast_tokenizer = T5Tokenizer.from_pretrained(model_path)
-    encoder_config = t5_model.encoder.config
-    decoder_config = t5_model.decoder.config
-    encoder_config.update({"num_experts": 0})
-    decoder_config.update({"num_experts": 0})
-    encoder_config.update({"moe_layer_index": []})
-    decoder_config.update({"moe_layer_index": []})
-    activation_type = encoder_config.feed_forward_proj
-    if activation_type == "gated-gelu" or activation_type == "gated-relu":
-        use_gated_activation = True
-    # https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py#L1660
-    # if tie_word_embeddings == True, scale the decoder output by sequence_output = sequence_output * (self.model_dim**-0.5)
-    tie_word_embeddings = decoder_config.tie_word_embeddings
-
-    q_scaling = 1.0 / (math.sqrt(encoder_config.d_kv))
-    ft_encoder_weight = FTT5EncoderWeight(
-        encoder_config,
-        tensor_para_size,
-        pipeline_para_size,
-        t5_with_bias=t5_with_bias,
-        use_gated_activation=use_gated_activation,
-        t5_with_moe=t5_with_moe,
-        position_embedding_type=position_embedding_type,
-        weight_data_type=weight_data_type,
-    )
-    ft_decoding_weight = FTT5DecodingWeight(
-        decoder_config,
-        tensor_para_size,
-        pipeline_para_size,
-        t5_with_bias=t5_with_bias,
-        use_gated_activation=use_gated_activation,
-        t5_with_moe=t5_with_moe,
-        position_embedding_type=position_embedding_type,
-        weight_data_type=weight_data_type,
-    )
-
-    if args_dict["ckpt_path"] is not None:
-        ft_encoder_weight.load_from_bin(args_dict["ckpt_path"], model_type, load_data_type)
-        ft_decoding_weight.load_from_bin(args_dict["ckpt_path"], model_type, load_data_type)
-    else:
-        ft_encoder_weight.load_from_model(t5_model)
-        ft_decoding_weight.load_from_model(t5_model)
-
-    result = TranslationResult("ft-samping", "FT")
-    pipelining_result = TranslationResult("ft-sampling", "FT")
-    
-    remove_padding = True if batch_size > 32 else False
-    ft_encoder = FTT5Encoder(ft_encoder_weight.w, lib_path, encoder_config.num_heads,
-                            encoder_config.d_kv, encoder_config.d_ff,
-                            encoder_config.d_model, remove_padding, encoder_config.num_layers,
-                            encoder_config.relative_attention_num_buckets, encoder_config.num_experts, encoder_config.moe_layer_index,
-                            128, False, q_scaling, tensor_para_size, pipeline_para_size, t5_with_bias,
-                            position_embedding_type, moe_k=0,
-                            activation_type=activation_type,)
-    ft_decoding = FTT5Decoding(ft_decoding_weight.w, lib_path,
-                            decoder_config.num_heads, decoder_config.d_kv,
-                            decoder_config.d_ff, encoder_config.d_model,
-                            decoder_config.d_model, decoder_config.num_layers,
-                            decoder_config.decoder_start_token_id, decoder_config.eos_token_id,
-                            decoder_config.vocab_size,
-                            q_scaling,
-                            decoder_config.relative_attention_num_buckets, decoder_config.num_experts, decoder_config.moe_layer_index, max_distance=128,
-                            tensor_para_size=tensor_para_size, pipeline_para_size=pipeline_para_size,
-                            t5_with_bias=t5_with_bias,
-                            position_embedding_type=position_embedding_type, moe_k=0,
-                            activation_type=activation_type, tie_word_embeddings=tie_word_embeddings,)
-
-    ft_t5 = FTT5(ft_encoder, ft_decoding)
-    # TODO: try other prompts and see what the LM produces
-    with open(source_file, 'r') as f:
-        src_text = recover_bpe(f.readlines())
-        src_text = ["translate English to German: " + line.strip() for line in src_text]
-    
-    with open(tgt_file, 'r') as f:
-        tgt_text = recover_bpe(f.readlines())
-
-    # now repeat, but for the pipelined version 
-    fifo_path = "ft_fifo"
-    if os.path.exists(fifo_path):
-        os.unlink(fifo_path)
-    # make fifo
-    os.mkfifo(fifo_path, 0x600)
-    prev = 0
-    # for now, just do 1 inference
-    batch_id = -1
-    queue = mp.Queue()
-    full_translation_result = TranslationResult("pipelining", "FT")
-    translation_results = []
-    start_time = datetime.now()
-    while prev < len(src_text):
-        batch_id += 1
-        p = mp.Process(target = read_from_pipe_and_tokenize,
-                   args = (queue, 
-                           fast_tokenizer, 
-                           fifo_path,
-                           max_seq_len, 
-                           min(batch_size, len(src_text) - prev), 
-                           batch_id))
-        p.start()
-        input_texts = src_text[prev:prev + batch_size]
-        prev += batch_size
-        input_token = tokenizer(input_texts, return_tensors = 'pt', padding =True)
-        bad_words_list = None
-        stop_words_list = None
-        tmp_beam_size = beam_size
-        ft_decoding_outputs, ft_decoding_seq_lens = ft_t5(input_token,
-                                                                  None,
-                                                                  tmp_beam_size,
-                                                                  max_seq_len,
-                                                                  topk,
-                                                                  topp,
-                                                                  beam_search_diversity_rate=beam_search_diversity_rate,
-                                                                  is_return_output_log_probs=False,
-                                                                  is_return_cum_log_probs=False,
-                                                                  repetition_penalty=repetition_penalty,
-                                                                  temperature=temperature,
-                                                                  len_penalty=len_penalty,
-                                                                  bad_words_list=bad_words_list,
-                                                                  stop_words_list=stop_words_list,
-                                                                  intermediate_fifo_file=fifo_path)
-        p.join()
-        translation_results.append(queue.get())
-    stop_time = datetime.now()
-    for x in translation_results:
-        full_translation_result += x
-    full_translation_result.execution_time = (stop_time -
-                                              start_time).total_seconds()
-    LOGGER.info(f"Finished full inference in"\
-                f" {full_translation_result.execution_time}s.")
-
 def read_int32_from_file(f):
     buffer_size = 4
     buffer = b''
@@ -389,30 +316,6 @@ def read_bool_from_file(f):
             if struct.unpack("?", buffer)[0]:
                 return 1
             return 0
-
-def read_from_pipe_and_tokenize(queue, 
-                                fast_tokenizer, 
-                                fifo_path, 
-                                max_seq_len,
-                                batch_size, 
-                                batch_id):
-    translation_result = TranslationResult(f"batch_{batch_id}", "HT")
-    for idx in range(batch_size):
-        translation_result.token_list.append([])
-    # TODO: also write to new token stream to link to next output
-    r = os.open(fifo_path, os.O_RDONLY)
-    tokens_read = 0
-    finished = [0 for _ in range(batch_size)]
-    while sum(finished) < batch_size:
-        index = read_int32_from_file(r)
-        value = read_int32_from_file(r)
-        index_done = read_bool_from_file(r)
-        tokenized = fast_tokenizer.decode([value],
-                                          skip_special_tokens = True)
-        translation_result.token_list[index].append(tokenized)
-        # TODO: put on a queue onto the next microservice in the pipeline
-        finished[index] = index_done
-    queue.put(translation_result) 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -442,6 +345,8 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_path', type=str, help='path to the checkpoint file.')
     parser.add_argument('-max_ite', '--max_iteration', type=int, default=100000, metavar='NUMBER',
                         help='Maximum iteraiton for translation, default is 100000 (as large as possible to run all test set).')
+    parser.add_argument("--fifo_path", default = "ft_fifo", help = "Fifo path"\
+    "used for IPC inside the FT process.")
     parser.add_argument("--verbose", action="store_true", help="Provide verbose messages")
     parser.add_argument("--port", type = int, default = 50051)
     parser.add_argument("--next_port", type = int, default = 50052)
