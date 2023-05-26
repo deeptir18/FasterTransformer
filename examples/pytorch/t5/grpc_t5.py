@@ -49,9 +49,100 @@ from examples.pytorch.t5.utils.ft_decoding import FTT5DecodingWeight, FTT5Decodi
 from examples.pytorch.decoding.utils.recover_bpe import recover_bpe
 
 LOGGER = logging.getLogger(__name__)
+class LmRetreiverPipeClient():
+    def __init__(self, args_dict):
+        self.batch_size = args_dict['batch_size']
+        model_path = args_dict['model_path'] if args_dict['model_path'] != None else args_dict['model']
+        self.tokenizer = T5Tokenizer.from_pretrained(model_path)
+        try:
+            self.fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
+        except:
+            self.fast_tokenizer = T5Tokenizer.from_pretrained(model_path)
+        next_port = args_dict['next_port']
+        self.next_service_address = f"localhost:{next_port}"
+        self.fifo_path = args_dict['fifo_path']
+        self.p = None
+        self.queue = mp.Queue()
+
+    def spawn_and_start(self):
+        if not(os.path.exists(self.fifo_path)):
+            os.mkfifo(self.fifo_path, 0x600)
+        p = mp.Process(target = service_pipe_tokens,
+                       args = (
+                           self.queue,
+                           self.fast_tokenizer,
+                           self.fifo_path,
+                           self.next_service_address,
+                           ))
+        self.p = p
+        self.p.start()
+        return self.queue
+
+    def put(self, val):
+        self.queue.put(val)
+
+    def join(self):
+        if self.p == None:
+            LOGGER.error("Trying to join on none client")
+            exit(1)
+        self.p.join()
+        
+
+def service_pipe_tokens(queue, fast_tokenizer, fifo_path, next_service_address):
+    channel = grpc.insecure_channel(next_service_address)
+    stub = lm_retriever_pb2_grpc.LmRetrieverStub(channel)
+    while True:
+        signal = queue.get()
+        if signal == "start":
+            batch_start = queue.get()
+            batch_size = queue.get()
+            LOGGER.info(f"Received start signal to read from pipe for start id:"\
+                    f"id: {batch_start}, batch_size: {batch_size}")
+            ## wait on loop for request to open
+            r = os.open(fifo_path, os.O_RDONLY)
+            tokens_read = 0
+            finished = [0 for _ in range(batch_size)]
+            is_start = True
+            while sum(finished) < batch_size:
+                cur_finished = sum(finished)
+                num_tokens_read = 0
+                token_batch = lm_retriever_pb2.TokenBatch(tokens=[])
+                ## first token in sequence
+                while num_tokens_read < (batch_size - cur_finished):
+                    index = read_int32_from_file(r)
+                    value = read_int32_from_file(r)
+                    index_done = read_bool_from_file(r)
+                    num_tokens_read += 1
+                    finished[index] = index_done
+                    tokenized = fast_tokenizer.decode([value],
+                                          skip_special_tokens = True)
+                    LOGGER.info(f"Read out of pipe: index {index}, value {value},"\
+                    f"tokenized {tokenized}, is_done {index_done}")
+                    token = lm_retriever_pb2.Token(word=tokenized,
+                                       is_end=index_done,
+                                       request_id=batch_start+index)
+                    if tokenized != "" or index_done:
+                        token_batch.tokens.append(token)
+                    token_batch.is_start = is_start
+                LOGGER.info("Finished with token batch")
+                empty = stub.RunRetrieverTokenizerPipelined(token_batch)
+                # for rest of tokens, is start is false
+                is_start = False
+            LOGGER.info("Done with request")
+        elif signal == "end":
+            break
+            return
+
+
 
 class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
-    def __init__(self, args_dict):
+    def __del__(self):
+        if self.client_obj is not None:
+            self.client_obj.put("end")
+            self.client_obj.join()
+            LOGGER.info("Joined on client obj process")
+
+    def __init__(self, args_dict, client_obj = None):
         super().__init__()
         self.args_dict = args_dict
         args_dict['beam_size'] = 1
@@ -70,8 +161,12 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
             self.fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
         except:
             self.fast_tokenizer = T5Tokenizer.from_pretrained(model_path)
-        ## TODO: open grpc client connection to the Rust tokenizer for sending
-        ## requests to the next service
+        next_port = args_dict['next_port']
+        self.next_service_address = f"localhost:{next_port}"
+
+        self.client_obj = client_obj
+        self.channel = grpc.insecure_channel(self.next_service_address)
+        self.stub = lm_retriever_pb2_grpc.LmRetrieverStub(self.channel)
     
     def get(self, var):
         return self.args_dict[var]
@@ -81,6 +176,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         LOGGER.info(f"Received non pipelined request with batch size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
+        LOGGER.info(f"Batch input: {input_texts}")
         if len(input_texts) != self.get('batch_size'):
             LOGGER.warn(f"Got input text length {len(input_texts)}; batch size"\
                         f"is {self.get('batch_size')}.")
@@ -103,6 +199,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
                                                                   is_return_cum_log_probs=False,
                                                                   repetition_penalty=self.get('repetition_penalty'),
                                                                   temperature=self.get('temperature'),
+                                                                  min_length=32,
                                                                   len_penalty=self.get('len_penalty'),
                                                                   bad_words_list=bad_words_list,
                                                                   stop_words_list=stop_words_list,
@@ -114,11 +211,12 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
             token_list = self.fast_tokenizer.decode(
                     ft_decoding_outputs[b][0][:seq_len],
                     skip_special_tokens = True)
-            print(token_list)
+            LOGGER.info(f"Output: {token_list}")
             lm_output = lm_retriever_pb2.LmOutput(output = token_list,
                                                   request_id=request.query[b].request_id)
             lm_output_batch.outputs.append(lm_output)
-        ## TODO: send token_vec_batch to the next microservice
+
+        empty = self.stub.RunRetrieverTokenizer(lm_output_batch)
         return lm_retriever_pb2.Empty()
     
     def RunLanguageModelPipelined(self, request, context):
@@ -127,64 +225,34 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
         input_tokens = self.tokenizer(input_texts, return_tensors = 'pt', padding =True)
-        if not(os.path.exists(self.fifo_path)):
-            os.mkfifo(self.fifo_path, 0x600)
-        p = mp.Process(target = read_from_pipe_and_tokenize,
-                       args = (
-                           self.fast_tokenizer,
-                           self.fifo_path,
-                           batch_size,
-                           request.query[0].request_id,
-                           ))
-        p.start()
         bad_words_list = None
         stop_words_list = None
         tmp_beam_size =  self.get('beam_size')
+
+        ## send start signal on queue
+        if self.client_obj is None:
+            LOGGER.error("In run language modeled pipeline but queue is none")
+            return lm_retriever_pb2.Empty()
+        self.client_obj.put("start")
+        self.client_obj.put(request.query[0].request_id)
+        self.client_obj.put(len(request.query))
         ft_decoding_outputs, ft_decoding_seq_lens = self.ft_t5(input_tokens,
                                                                   None,
                                                                   tmp_beam_size,
                                                                   self.get('max_seq_len'),
                                                                   self.get('topk'),
                                                                   self.get('topp'),
-                                                               beam_search_diversity_rate=self.get('beam_search_diversity_rate'),
+                                                                  beam_search_diversity_rate=self.get('beam_search_diversity_rate'),
                                                                   is_return_output_log_probs=False,
                                                                   is_return_cum_log_probs=False,
                                                                   repetition_penalty=self.get('repetition_penalty'),
                                                                   temperature=self.get('temperature'),
+                                                                  min_length=32,
                                                                   len_penalty=self.get('len_penalty'),
                                                                   bad_words_list=bad_words_list,
                                                                   stop_words_list=stop_words_list,
                                                                   intermediate_fifo_file=self.fifo_path)
-        p.join()
-        LOGGER.info("Joined subprocess")
         return lm_retriever_pb2.Empty()
-
-def read_from_pipe_and_tokenize(fast_tokenizer, 
-                                fifo_path, 
-                                batch_size,
-                                batch_start):
-    LOGGER.info("In read from pipe with tokenize")
-    LOGGER.info(f"fifo_path: {fifo_path}, batch_size: {batch_size}, batch_start: {batch_start}")
-    r = os.open(fifo_path, os.O_RDONLY)
-    tokens_read = 0
-    finished = [0 for _ in range(batch_size)]
-    token_batch = lm_retriever_pb2.TokenBatch(tokens=[])
-    while sum(finished) < batch_size:
-        index = read_int32_from_file(r)
-        value = read_int32_from_file(r)
-        index_done = read_bool_from_file(r)
-        tokenized = fast_tokenizer.decode([value],
-                                          skip_special_tokens = True)
-        LOGGER.info(f"Read out of pipe: index {index}, value {value},"\
-                    f"tokenized {tokenized}, is_done {index_done}")
-        token = lm_retriever_pb2.Token(word=tokenized,
-                                       is_start=index==0,
-                                       is_end=index_done,
-                                       request_id=batch_start+index)
-        token_batch.tokens.append(token)
-        finished[index] = index_done
-    print(token_batch)
-    LOGGER.info("Returning")
 
 def init_ftt5(args_dict):
     torch.set_printoptions(precision=6)
@@ -314,8 +382,8 @@ def read_bool_from_file(f):
         buffer += data
         if len(buffer) == buffer_size:
             if struct.unpack("?", buffer)[0]:
-                return 1
-            return 0
+                return True
+            return False
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -347,13 +415,22 @@ if __name__ == '__main__':
                         help='Maximum iteraiton for translation, default is 100000 (as large as possible to run all test set).')
     parser.add_argument("--fifo_path", default = "ft_fifo", help = "Fifo path"\
     "used for IPC inside the FT process.")
+    parser.add_argument("--pipelining", action="store_true", help="Enable"\
+                        "pipelining")
     parser.add_argument("--verbose", action="store_true", help="Provide verbose messages")
     parser.add_argument("--port", type = int, default = 50051)
     parser.add_argument("--next_port", type = int, default = 50052)
     args = parser.parse_args()
     log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format=log_format)
-    service = LmRetrieverServicer(vars(args))
+        
+    client = None
+    if args.pipelining:
+        client = LmRetreiverPipeClient(vars(args))
+        ## calls fork and initializes grpc client *before* server is spawned
+        client.spawn_and_start()
+    service = LmRetrieverServicer(vars(args), client)
+
     server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers = 1))
     lm_retriever_pb2_grpc.add_LmRetrieverServicer_to_server(service, server)
     port = args.port
