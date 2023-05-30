@@ -14,6 +14,8 @@
 
 import concurrent.futures
 import grpc
+from grpc import aio
+import asyncio
 import argparse
 import collections
 import configparser
@@ -89,49 +91,54 @@ class LmRetreiverPipeClient():
         
 
 def service_pipe_tokens(queue, fast_tokenizer, fifo_path, next_service_address):
-    channel = grpc.insecure_channel(next_service_address)
-    stub = lm_retriever_pb2_grpc.LmRetrieverStub(channel)
-    while True:
-        signal = queue.get()
-        if signal == "start":
-            batch_start = queue.get()
-            batch_size = queue.get()
-            LOGGER.info(f"Received start signal to read from pipe for start id:"\
-                    f"id: {batch_start}, batch_size: {batch_size}")
-            ## wait on loop for request to open
-            r = os.open(fifo_path, os.O_RDONLY)
-            tokens_read = 0
-            finished = [0 for _ in range(batch_size)]
-            is_start = True
-            while sum(finished) < batch_size:
-                cur_finished = sum(finished)
-                num_tokens_read = 0
-                token_batch = lm_retriever_pb2.TokenBatch(tokens=[])
-                ## first token in sequence
-                while num_tokens_read < (batch_size - cur_finished):
-                    index = read_int32_from_file(r)
-                    value = read_int32_from_file(r)
-                    index_done = read_bool_from_file(r)
-                    num_tokens_read += 1
-                    finished[index] = index_done
-                    tokenized = fast_tokenizer.decode([value],
-                                          skip_special_tokens = True)
-                    LOGGER.info(f"Read out of pipe: index {index}, value {value},"\
-                    f"tokenized {tokenized}, is_done {index_done}")
-                    token = lm_retriever_pb2.Token(word=tokenized,
-                                       is_end=index_done,
-                                       request_id=batch_start+index)
-                    if tokenized != "" or index_done:
-                        token_batch.tokens.append(token)
-                    token_batch.is_start = is_start
-                LOGGER.info("Finished with token batch")
-                empty = stub.RunRetrieverTokenizerPipelined(token_batch)
-                # for rest of tokens, is start is false
-                is_start = False
-            LOGGER.info("Done with request")
-        elif signal == "end":
-            break
-            return
+    asyncio.run(service_pipe_tokens_async(queue, fast_tokenizer, fifo_path,
+                                         next_service_address))
+async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_service_address):
+    async with aio.insecure_channel(next_service_address) as channel:
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor()
+        stub = lm_retriever_pb2_grpc.LmRetrieverStub(channel)
+        while True:
+            signal = queue.get()
+            if signal == "start":
+                batch_start = queue.get()
+                batch_size = queue.get()
+                #LOGGER.debug(f"Received start signal to read from pipe for start id:"\
+                #           f"id: {batch_start}, batch_size: {batch_size}")
+                ## wait on loop for request to open
+                r = os.open(fifo_path, os.O_RDONLY)
+                open_file_handle = open(r, 'rb')
+                tokens_read = 0
+                finished = [0 for _ in range(batch_size)]
+                is_start = True
+                while sum(finished) < batch_size:
+                    cur_finished = sum(finished)
+                    num_tokens_read = 0
+                    token_batch = lm_retriever_pb2.TokenBatch(tokens=[])
+                    ## first token in sequence
+                    while num_tokens_read < (batch_size - cur_finished):
+                        index, value, index_done = await read_int32s_and_boolean(open_file_handle, loop, executor)	
+                        num_tokens_read += 1
+                        finished[index] = index_done
+                        tokenized = fast_tokenizer.decode([value],
+                                            skip_special_tokens = True)
+                        #LOGGER.debug(f"Read out of pipe: index {index}, value {value},"\
+                        #f"tokenized {tokenized}, is_done {index_done}")
+                        token = lm_retriever_pb2.Token(word=tokenized,
+                                        is_end=index_done,
+                                        request_id=batch_start+index)
+                        if tokenized != "" or index_done:
+                            token_batch.tokens.append(token)
+                        token_batch.is_start = is_start
+                    #LOGGER.debug("Finished with token batch")
+                    if len(token_batch.tokens) > 0:
+                        empty = await stub.RunRetrieverTokenizerPipelined(token_batch)
+                    # for rest of tokens, is start is false
+                    is_start = False
+                #LOGGER.debug("Done with request")
+            elif signal == "end":
+                break
+                return
 
 
 
@@ -140,7 +147,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         if self.client_obj is not None:
             self.client_obj.put("end")
             self.client_obj.join()
-            LOGGER.info("Joined on client obj process")
+            #LOGGER.info("Joined on client obj process")
 
     def __init__(self, args_dict, client_obj = None):
         super().__init__()
@@ -165,21 +172,21 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         self.next_service_address = f"localhost:{next_port}"
 
         self.client_obj = client_obj
-        self.channel = grpc.insecure_channel(self.next_service_address)
+        self.channel = aio.insecure_channel(self.next_service_address)
         self.stub = lm_retriever_pb2_grpc.LmRetrieverStub(self.channel)
     
     def get(self, var):
         return self.args_dict[var]
     
-    def RunLanguageModel(self, request, context):
+    async def RunLanguageModel(self, request, context):
         batch_size = len(request.query)
-        LOGGER.info(f"Received non pipelined request with batch size {batch_size}")
+        #LOGGER.debug(f"Received non pipelined request with batch size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
-        LOGGER.info(f"Batch input: {input_texts}")
+        #LOGGER.debug(f"Batch input: {input_texts}")
         if len(input_texts) != self.get('batch_size'):
-            LOGGER.warn(f"Got input text length {len(input_texts)}; batch size"\
-                        f"is {self.get('batch_size')}.")
+            #LOGGER.debug(f"Got input text length {len(input_texts)}; batch size"\
+                        #f"is {self.get('batch_size')}.")
             ## TODO: add Error option to RPC
             return lm_retriever_pb2.Empty()
         input_tokens = self.tokenizer(input_texts, 
@@ -211,17 +218,17 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
             token_list = self.fast_tokenizer.decode(
                     ft_decoding_outputs[b][0][:seq_len],
                     skip_special_tokens = True)
-            LOGGER.info(f"Output: {token_list}")
+            LOGGER.debug(f"Output: {token_list}")
             lm_output = lm_retriever_pb2.LmOutput(output = token_list,
                                                   request_id=request.query[b].request_id)
             lm_output_batch.outputs.append(lm_output)
 
-        empty = self.stub.RunRetrieverTokenizer(lm_output_batch)
+        empty = await self.stub.RunRetrieverTokenizer(lm_output_batch)
         return lm_retriever_pb2.Empty()
     
-    def RunLanguageModelPipelined(self, request, context):
+    async def RunLanguageModelPipelined(self, request, context):
         batch_size = len(request.query)
-        print(f"Received pipelined request with batch_size {batch_size}")
+        #LOGGER.debug(f"Received pipelined request with batch_size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
         input_tokens = self.tokenizer(input_texts, return_tensors = 'pt', padding =True)
@@ -365,25 +372,25 @@ def init_ftt5(args_dict):
     ft_t5 = FTT5(ft_encoder, ft_decoding)
     return ft_t5
 
-def read_int32_from_file(f):
-    buffer_size = 4
-    buffer = b''
-    while True:
-        data = os.read(f, buffer_size)
-        buffer += data
-        if len(buffer) == buffer_size:
-            return struct.unpack("i", buffer)[0]
+async def read_int32s_and_boolean(open_file_handle, loop, executor):
+    data = None
+    while not data:
+        data = await loop.run_in_executor(executor, open_file_handle.read, 9)
+    if len(data) < 9:
+        raise ValueError("Invalid data length")
 
-def read_bool_from_file(f):
-    buffer_size = 1
-    buffer = b''
-    while True:
-        data = os.read(f, buffer_size)
-        buffer += data
-        if len(buffer) == buffer_size:
-            if struct.unpack("?", buffer)[0]:
-                return True
-            return False
+    int1, int2, boolean = int.from_bytes(data[:4], 'little'), int.from_bytes(data[4:8], 'little'), bool(data[8])
+    return (int1, int2, boolean)
+
+async def serve(args, client):
+    service = LmRetrieverServicer(vars(args), client)
+    server = aio.server()
+    lm_retriever_pb2_grpc.add_LmRetrieverServicer_to_server(service, server)
+    port = args.port
+    server.add_insecure_port('[::]:{}'.format(port))
+    await server.start()
+    await server.wait_for_termination()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -429,11 +436,4 @@ if __name__ == '__main__':
         client = LmRetreiverPipeClient(vars(args))
         ## calls fork and initializes grpc client *before* server is spawned
         client.spawn_and_start()
-    service = LmRetrieverServicer(vars(args), client)
-
-    server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers = 1))
-    lm_retriever_pb2_grpc.add_LmRetrieverServicer_to_server(service, server)
-    port = args.port
-    server.add_insecure_port('[::]:{}'.format(port))
-    server.start()
-    server.wait_for_termination()
+    asyncio.run(serve(args, client))
