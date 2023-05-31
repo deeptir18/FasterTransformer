@@ -103,8 +103,8 @@ async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_servi
             if signal == "start":
                 batch_start = queue.get()
                 batch_size = queue.get()
-                #LOGGER.debug(f"Received start signal to read from pipe for start id:"\
-                #           f"id: {batch_start}, batch_size: {batch_size}")
+                LOGGER.debug(f"Received start signal to read from pipe for start id:"\
+                           f"id: {batch_start}, batch_size: {batch_size}")
                 ## wait on loop for request to open
                 r = os.open(fifo_path, os.O_RDONLY)
                 open_file_handle = open(r, 'rb')
@@ -119,19 +119,22 @@ async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_servi
                     while num_tokens_read < (batch_size - cur_finished):
                         index, value, index_done = await read_int32s_and_boolean(open_file_handle, loop, executor)	
                         num_tokens_read += 1
-                        finished[index] = index_done
                         tokenized = fast_tokenizer.decode([value],
                                             skip_special_tokens = True)
-                        #LOGGER.debug(f"Read out of pipe: index {index}, value {value},"\
-                        #f"tokenized {tokenized}, is_done {index_done}")
-                        token = lm_retriever_pb2.Token(word=tokenized,
-                                        is_end=index_done,
+                        LOGGER.debug(f"Read out of pipe: index {index}, value {value},"\
+                        f"tokenized {tokenized}, is_done {index_done}")
+                        token_is_end = index_done and finished[index] == 0
+                        if tokenized != "" or token_is_end:
+                            token = lm_retriever_pb2.Token(word=tokenized,
+                                        is_end=token_is_end,
                                         request_id=batch_start+index)
-                        if tokenized != "" or index_done:
                             token_batch.tokens.append(token)
-                        token_batch.is_start = is_start
-                    #LOGGER.debug("Finished with token batch")
+                            #if token_is_end:
+                                #LOGGER.info(f"Sent is done for req {batch_start + index}")
+                            if index_done:
+                                finished[index] = 1
                     if len(token_batch.tokens) > 0:
+                        token_batch.is_start = is_start
                         empty = await stub.RunRetrieverTokenizerPipelined(token_batch)
                     # for rest of tokens, is start is false
                     is_start = False
