@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import random
 import concurrent.futures
 import grpc
 from grpc import aio
@@ -49,6 +49,15 @@ from proto_out import lm_retriever_pb2, lm_retriever_pb2_grpc # transformers-4.1
 from examples.pytorch.t5.utils.ft_encoder import FTT5EncoderWeight, FTT5Encoder
 from examples.pytorch.t5.utils.ft_decoding import FTT5DecodingWeight, FTT5Decoding, FTT5
 from examples.pytorch.decoding.utils.recover_bpe import recover_bpe
+
+import datetime
+
+epoch = datetime.datetime.utcfromtimestamp(0)
+def get_time_since_epoch_ms():
+    now = datetime.datetime.now()
+    delta = now - epoch
+    milliseconds = (delta.days * 24 * 60 * 60 + delta.seconds) * 1_000 + delta.microseconds / 1000
+    return int(milliseconds)
 
 LOGGER = logging.getLogger(__name__)
 class LmRetreiverPipeClient():
@@ -103,6 +112,7 @@ async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_servi
             if signal == "start":
                 batch_start = queue.get()
                 batch_size = queue.get()
+                start_timestamp = queue.get()
                 LOGGER.debug(f"Received start signal to read from pipe for start id:"\
                            f"id: {batch_start}, batch_size: {batch_size}")
                 ## wait on loop for request to open
@@ -118,6 +128,7 @@ async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_servi
                     ## first token in sequence
                     while num_tokens_read < (batch_size - cur_finished):
                         index, value, index_done = await read_int32s_and_boolean(open_file_handle, loop, executor)	
+                        end = get_time_since_epoch_ms()
                         num_tokens_read += 1
                         tokenized = fast_tokenizer.decode([value],
                                             skip_special_tokens = True)
@@ -126,9 +137,18 @@ async def service_pipe_tokens_async(queue, fast_tokenizer, fifo_path, next_servi
                         token_is_end = index_done and finished[index] == 0
                         if tokenized != "" or token_is_end:
                             token = lm_retriever_pb2.Token(word=tokenized,
-                                        is_end=token_is_end,
-                                        request_id=batch_start+index)
-                            token_batch.tokens.append(token)
+                                                is_end=token_is_end,
+                                                request_id=batch_start+index,
+                                                timestamps=[
+                                                    lm_retriever_pb2.ServiceTimestamp(
+                                                            start=start_timestamp,
+                                                            end=end,
+                                                    )]
+                                            )
+                            if is_start or\
+                                    token_is_end or\
+                                    random.randint(1,100) <= 98:
+                                token_batch.tokens.append(token)
                             #if token_is_end:
                                 #LOGGER.info(f"Sent is done for req {batch_start + index}")
                             if index_done:
@@ -182,6 +202,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         return self.args_dict[var]
     
     async def RunLanguageModel(self, request, context):
+        start_time = get_time_since_epoch_ms()
         batch_size = len(request.query)
         #LOGGER.debug(f"Received non pipelined request with batch size {batch_size}")
         input_texts = [f"{query.prepend}: {query.prompt}" if
@@ -222,8 +243,13 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
                     ft_decoding_outputs[b][0][:seq_len],
                     skip_special_tokens = True)
             LOGGER.debug(f"Output: {token_list}")
+            end_timestamp = get_time_since_epoch_ms()
+            timestamp = lm_retriever_pb2.ServiceTimestamp(start =
+                                                          start_time,
+                                                          end=end_timestamp)
             lm_output = lm_retriever_pb2.LmOutput(output = token_list,
-                                                  request_id=request.query[b].request_id)
+                                                  request_id=request.query[b].request_id,
+                                                  timestamps=[timestamp])
             lm_output_batch.outputs.append(lm_output)
 
         empty = await self.stub.RunRetrieverTokenizer(lm_output_batch)
@@ -235,6 +261,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         input_texts = [f"{query.prepend}: {query.prompt}" if
                        query.prepend != None else query.prompt for query in request.query]
         input_tokens = self.tokenizer(input_texts, return_tensors = 'pt', padding =True)
+        start_time = get_time_since_epoch_ms()
         bad_words_list = None
         stop_words_list = None
         tmp_beam_size =  self.get('beam_size')
@@ -246,6 +273,7 @@ class LmRetrieverServicer(lm_retriever_pb2_grpc.LmRetrieverServicer):
         self.client_obj.put("start")
         self.client_obj.put(request.query[0].request_id)
         self.client_obj.put(len(request.query))
+        self.client_obj.put(start_time)
         ft_decoding_outputs, ft_decoding_seq_lens = self.ft_t5(input_tokens,
                                                                   None,
                                                                   tmp_beam_size,
